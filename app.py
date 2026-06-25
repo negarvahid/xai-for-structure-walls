@@ -824,14 +824,17 @@ def _run_pipeline_inner(seed, test_size, n_interactions, _data_source):
     ebm_train_pred = ebm.predict(X_train_sel)
     ebm_pred       = ebm.predict(X_test_sel)
 
-    k_ebm = len(feature_names_sel) + 1
+    # Complexity = main-effect features + realized pairwise interaction terms.
+    n_inter_terms = sum(1 for tf in ebm.term_features_ if len(tf) > 1)
+    p_ebm = len(feature_names_sel) + n_inter_terms   # predictors (for adjusted R²)
+    k_ebm = p_ebm + 1                                # params incl. intercept (for AIC/BIC)
     ebm_r2_train = r2_score(y_train_aug, ebm_train_pred)
     ebm_r2_test  = r2_score(y_test, ebm_pred)
     ebm_metrics  = {
         "train_r2":     ebm_r2_train,
         "test_r2":      ebm_r2_test,
-        "train_adj_r2": adjusted_r2(ebm_r2_train, len(y_train_aug), len(feature_names_sel)),
-        "test_adj_r2":  adjusted_r2(ebm_r2_test,  len(y_test),      len(feature_names_sel)),
+        "train_adj_r2": adjusted_r2(ebm_r2_train, len(y_train_aug), p_ebm),
+        "test_adj_r2":  adjusted_r2(ebm_r2_test,  len(y_test),      p_ebm),
         "train_rmse":   float(np.sqrt(mean_squared_error(y_train_aug, ebm_train_pred))),
         "test_rmse":    float(np.sqrt(mean_squared_error(y_test, ebm_pred))),
         "train_mae":    float(mean_absolute_error(y_train_aug, ebm_train_pred)),
@@ -923,7 +926,11 @@ def run_ebm_interaction_sweep(X_train_sel, X_test_sel, y_train_aug, y_test,
         train_pred = ebm.predict(X_train_sel)
         test_pred  = ebm.predict(X_test_sel)
 
-        k = len(feature_names_sel) + 1
+        # Complexity scales with the interaction terms the EBM actually realized,
+        # so AIC/BIC/Adj R² penalize larger n_interactions.
+        n_inter_terms = sum(1 for tf in ebm.term_features_ if len(tf) > 1)
+        p = len(feature_names_sel) + n_inter_terms   # predictors (for adjusted R²)
+        k = p + 1                                    # params incl. intercept (for AIC/BIC)
         n_tr, n_te = len(y_train_aug), len(y_test)
 
         r2_tr  = r2_score(y_train_aug, train_pred)
@@ -948,8 +955,8 @@ def run_ebm_interaction_sweep(X_train_sel, X_test_sel, y_train_aug, y_test,
             "n_interactions":   n,
             "train_r2":         round(r2_tr,  4),
             "test_r2":          round(r2_te,  4),
-            "train_adj_r2":     round(adjusted_r2(r2_tr, n_tr, k), 4),
-            "test_adj_r2":      round(adjusted_r2(r2_te, n_te, k), 4),
+            "train_adj_r2":     round(adjusted_r2(r2_tr, n_tr, p), 4),
+            "test_adj_r2":      round(adjusted_r2(r2_te, n_te, p), 4),
             "r2_gap":           round(r2_tr - r2_te, 4),          # overfitting proxy
             "train_rmse":       round(rmse_tr, 4),
             "test_rmse":        round(rmse_te, 4),
