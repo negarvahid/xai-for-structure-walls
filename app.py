@@ -131,6 +131,7 @@ MODEL_COLORS = {
     "Random Forest":    "#334155",   # slate
     "XGBoost":          "#b45309",   # amber
     "EBM":              "#991b1b",   # crimson
+    "NAM":              "#1d4ed8",   # blue
     "NAM+Interactions": "#365314",   # forest
 }
 
@@ -429,27 +430,33 @@ with st.sidebar:
         if st.button("Build ZIP", use_container_width=True,
                      help="Packages all CSVs and PNGs into a single ZIP file"):
             with st.spinner("Building ZIP…"):
-                _res = st.session_state["results"]
-                zip_bytes = build_results_zip(
-                    _res,
-                    {
-                        "Random Forest":    _res["rf_metrics"],
-                        "XGBoost":          _res["xgb_metrics"],
-                        "EBM":              _res["ebm_metrics"],
-                        "NAM+Interactions": _res["nam_metrics"],
-                    },
-                    {
-                        "Random Forest":    _res["rf_pred"],
-                        "XGBoost":          _res["xgb_pred"],
-                        "EBM":              _res["ebm_pred"],
-                        "NAM+Interactions": _res["nam_pred"],
-                    },
-                    _res["y_test"],
-                    _res["feature_names_sel"],
-                    _res["ebm"].term_importances(),
-                    [_term_label(i) for i in range(len(_res["ebm"].term_names_))],
-                )
-                st.session_state["zip_bytes"] = zip_bytes
+                try:
+                    _res = st.session_state["results"]
+                    zip_bytes = build_results_zip(
+                        _res,
+                        {
+                            "Random Forest":    _res["rf_metrics"],
+                            "XGBoost":          _res["xgb_metrics"],
+                            "EBM":              _res["ebm_metrics"],
+                            "NAM+Interactions": _res["nam_metrics"],
+                        },
+                        {
+                            "Random Forest":    _res["rf_pred"],
+                            "XGBoost":          _res["xgb_pred"],
+                            "EBM":              _res["ebm_pred"],
+                            "NAM+Interactions": _res["nam_pred"],
+                        },
+                        _res["y_test"],
+                        _res["feature_names_sel"],
+                        _res["ebm"].term_importances(),
+                        [
+                            " × ".join(str(n) for n in tn) if isinstance(tn, (list, tuple)) else str(tn)
+                            for tn in _res["ebm"].term_names_
+                        ],
+                    )
+                    st.session_state["zip_bytes"] = zip_bytes
+                except Exception as e:
+                    st.error(f"ZIP build failed: {e}")
 
         if "zip_bytes" in st.session_state:
             st.download_button(
@@ -573,6 +580,14 @@ def _run_pipeline_inner(seed, test_size, n_interactions, _data_source):
         for tf in ebm.term_features_ if len(tf) > 1
     ]
 
+    # Pure NAM (no interactions — ablation baseline)
+    (nam_base_model, nam_base_metrics, nam_base_pred, contributions_base,
+     (train_losses_base, val_losses_base), _, _) = train_nam(
+        X_train_sel, X_test_sel, y_train_aug, y_test, list(feature_names_sel),
+        hidden_units=[64, 32], epochs=300, random_state=seed, n_cycles=3,
+        interaction_pairs=[],
+    )
+
     # NAM with EBM-guided interactions
     (nam_model, nam_metrics, nam_pred, contributions,
      (train_losses, val_losses), inter_contribs, pair_labels) = train_nam(
@@ -588,6 +603,7 @@ def _run_pipeline_inner(seed, test_size, n_interactions, _data_source):
             "Random Forest":    rf_pred,
             "XGBoost":          xgb_pred,
             "EBM":              ebm_pred,
+            "NAM":              nam_base_pred,
             "NAM+Interactions": nam_pred,
         },
         n_bootstrap=1000,
@@ -597,12 +613,16 @@ def _run_pipeline_inner(seed, test_size, n_interactions, _data_source):
 
     return dict(
         ebm=ebm,
-        ebm_pred=ebm_pred, rf_pred=rf_pred, xgb_pred=xgb_pred, nam_pred=nam_pred,
+        ebm_pred=ebm_pred, rf_pred=rf_pred, xgb_pred=xgb_pred,
+        nam_base_pred=nam_base_pred, nam_pred=nam_pred,
         y_test=y_test,
         rf_metrics=rf_metrics, xgb_metrics=xgb_metrics,
-        ebm_metrics=ebm_metrics, nam_metrics=nam_metrics,
+        ebm_metrics=ebm_metrics,
+        nam_base_metrics=nam_base_metrics, nam_metrics=nam_metrics,
+        contributions_base=contributions_base,
         contributions=contributions,
         inter_contribs=inter_contribs, pair_labels=pair_labels,
+        train_losses_base=train_losses_base, val_losses_base=val_losses_base,
         train_losses=train_losses, val_losses=val_losses,
         X_test_sel=X_test_sel, X_train_sel=X_train_sel,
         y_train_aug=y_train_aug,
@@ -719,14 +739,15 @@ if "results" not in st.session_state:
         unsafe_allow_html=True,
     )
     st.markdown("")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     for c, (name, desc) in zip(
-        [c1, c2, c3, c4],
+        [c1, c2, c3, c4, c5],
         [
             ("Random Forest", "Nonlinear ensemble baseline"),
             ("XGBoost",       "Gradient-boosted trees"),
             ("EBM",           "Glass-box additive model"),
-            ("NAM",           "Neural additive model"),
+            ("NAM",           "Neural additive — no interactions"),
+            ("NAM+Inter",     "Neural additive + EBM-guided pairs"),
         ],
     ):
         c.markdown(
@@ -746,8 +767,8 @@ if "results" not in st.session_state:
 # LOAD RESULTS
 # ─────────────────────────────────────────────────────────────────────────────
 REQUIRED_KEYS = {
-    "rf_metrics", "xgb_metrics", "ebm_metrics", "nam_metrics",
-    "rf_pred", "xgb_pred", "ebm_pred", "nam_pred", "ci_results",
+    "rf_metrics", "xgb_metrics", "ebm_metrics", "nam_base_metrics", "nam_metrics",
+    "rf_pred", "xgb_pred", "ebm_pred", "nam_base_pred", "nam_pred", "ci_results",
     "X_train_sel", "y_train_aug",
 }
 if not REQUIRED_KEYS.issubset(st.session_state["results"].keys()):
@@ -790,12 +811,14 @@ ALL_METRICS = {
     "Random Forest":    res["rf_metrics"],
     "XGBoost":          res["xgb_metrics"],
     "EBM":              res["ebm_metrics"],
+    "NAM":              res["nam_base_metrics"],
     "NAM+Interactions": res["nam_metrics"],
 }
 ALL_PREDS = {
     "Random Forest":    res["rf_pred"],
     "XGBoost":          res["xgb_pred"],
     "EBM":              res["ebm_pred"],
+    "NAM":              res["nam_base_pred"],
     "NAM+Interactions": res["nam_pred"],
 }
 
@@ -832,7 +855,7 @@ with tab1:
 
     # Headline cards
     best_r2 = max(m["test_r2"] for m in ALL_METRICS.values())
-    cols = st.columns(4)
+    cols = st.columns(5)
     for col, (name, m) in zip(cols, ALL_METRICS.items()):
         is_best = abs(m["test_r2"] - best_r2) < 1e-6
         cls = "metric-card best" if is_best else "metric-card"
@@ -990,17 +1013,23 @@ with tab1:
     fig.update_layout(title=metric_bar, yaxis_title=metric_bar)
     st.plotly_chart(_style_fig(fig), use_container_width=True)
 
-    # NAM convergence
+    # NAM convergence — both variants
     st.divider()
     st.subheader("NAM backfitting convergence")
-    tl, vl = res["train_losses"], res["val_losses"]
+    st.caption("Solid = NAM+Interactions · Dashed = NAM (no interactions)")
+    tl,    vl    = res["train_losses"],      res["val_losses"]
+    tl_b,  vl_b  = res["train_losses_base"], res["val_losses_base"]
     fig = go.Figure()
-    fig.add_trace(go.Scatter(y=tl, mode="lines+markers", name="Train RMSE",
+    fig.add_trace(go.Scatter(y=tl_b, mode="lines+markers", name="NAM train",
+                             line=dict(color=MODEL_COLORS["NAM"], width=1.8, dash="dash")))
+    fig.add_trace(go.Scatter(y=vl_b, mode="lines+markers", name="NAM val",
+                             line=dict(color=MODEL_COLORS["NAM"], width=1.8, dash="dot")))
+    fig.add_trace(go.Scatter(y=tl, mode="lines+markers", name="NAM+Inter train",
                              line=dict(color=MODEL_COLORS["NAM+Interactions"], width=2)))
-    fig.add_trace(go.Scatter(y=vl, mode="lines+markers", name="Val RMSE",
-                             line=dict(color="#991b1b", width=2)))
+    fig.add_trace(go.Scatter(y=vl, mode="lines+markers", name="NAM+Inter val",
+                             line=dict(color=MODEL_COLORS["NAM+Interactions"], width=2, dash="dot")))
     fig.update_layout(xaxis_title="Backfitting cycle", yaxis_title="RMSE (raw sum)")
-    st.plotly_chart(_style_fig(fig, height=340, legend_y=0.97), use_container_width=True)
+    st.plotly_chart(_style_fig(fig, height=360, legend_y=0.97), use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1146,10 +1175,21 @@ with tab3:
 # TAB 4 — NAM SHAPES
 # ══════════════════════════════════════════════════════════════════════════════
 with tab4:
-    contributions  = res["contributions"]
     X_test_sel     = res["X_test_sel"]
     inter_contribs = res["inter_contribs"]
     pair_labels    = res["pair_labels"]
+
+    # Toggle between pure NAM and NAM+Interactions shapes
+    nam_variant = st.radio(
+        "Show shapes for",
+        ["NAM (no interactions)", "NAM+Interactions"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    using_base = nam_variant == "NAM (no interactions)"
+    contributions = res["contributions_base"] if using_base else res["contributions"]
+    variant_color = MODEL_COLORS["NAM"] if using_base else MODEL_COLORS["NAM+Interactions"]
+    variant_fill  = "rgba(29,78,216,0.10)" if using_base else "rgba(54,83,20,0.10)"
 
     mean_abs = [float(np.abs(c).mean()) for c in contributions]
     order    = np.argsort(mean_abs)[::-1]
@@ -1180,8 +1220,8 @@ with tab4:
                 fig.add_trace(go.Scatter(
                     x=x_orig[sort_idx], y=y_contrib[sort_idx],
                     mode="lines",
-                    line=dict(color=MODEL_COLORS["NAM+Interactions"], width=2.2),
-                    fill="tozeroy", fillcolor="rgba(54,83,20,0.10)",
+                    line=dict(color=variant_color, width=2.2),
+                    fill="tozeroy", fillcolor=variant_fill,
                 ))
                 fig.add_hline(y=0, line_dash="dot", line_color="#cbd5e1")
                 fig.update_layout(
