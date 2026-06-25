@@ -161,6 +161,18 @@ def _safe(s):
     return s.replace("/", "_").replace(" ", "_").replace("+", "_")
 
 
+def inv_1d(vals, feat_name, scaler, all_feature_names):
+    """Inverse-scale a single feature column (used for plotting in original units)."""
+    if feat_name not in all_feature_names:
+        return np.array(vals, dtype=float)
+    col_idx = list(all_feature_names).index(feat_name)
+    n_all   = len(all_feature_names)
+    vals    = np.array(vals, dtype=float)
+    X_tmp   = np.zeros((len(vals), n_all))
+    X_tmp[:, col_idx] = vals
+    return scaler.inverse_transform(X_tmp)[:, col_idx]
+
+
 def build_results_zip(res, all_metrics, all_preds, y_test, feat_sel,
                       importances, term_names, sweep_df=None, pipeline_log=""):
     """Build an in-memory ZIP covering every tab's data."""
@@ -888,18 +900,6 @@ def _run_pipeline_inner(seed, test_size, n_interactions, _data_source):
         ebm_interaction_pairs=ebm_interaction_pairs,
         ci_results=ci_results,
     )
-
-
-def inv_1d(vals, feat_name, scaler, all_feature_names):
-    """Inverse-scale a single feature column (used for plotting in original units)."""
-    if feat_name not in all_feature_names:
-        return np.array(vals, dtype=float)
-    col_idx = list(all_feature_names).index(feat_name)
-    n_all   = len(all_feature_names)
-    vals    = np.array(vals, dtype=float)
-    X_tmp   = np.zeros((len(vals), n_all))
-    X_tmp[:, col_idx] = vals
-    return scaler.inverse_transform(X_tmp)[:, col_idx]
 
 
 def run_ebm_interaction_sweep(X_train_sel, X_test_sel, y_train_aug, y_test,
