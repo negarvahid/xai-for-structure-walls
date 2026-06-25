@@ -157,13 +157,28 @@ def _style_fig(fig, height=380, legend_y=0.98):
 # ─────────────────────────────────────────────────────────────────────────────
 # DOWNLOAD HELPER
 # ─────────────────────────────────────────────────────────────────────────────
-def build_results_zip(res, all_metrics, all_preds, y_test, feat_sel, importances, term_names):
-    """Build an in-memory ZIP with all CSVs and PNGs for the current run."""
+def _safe(s):
+    return s.replace("/", "_").replace(" ", "_").replace("+", "_")
+
+
+def build_results_zip(res, all_metrics, all_preds, y_test, feat_sel,
+                      importances, term_names, sweep_df=None, pipeline_log=""):
+    """Build an in-memory ZIP covering every tab's data."""
+    scaler_   = res["scaler"]
+    all_feat_ = res["all_feature_names"]
+    X_test_   = res["X_test_sel"]
+    ebm_obj   = res["ebm"]
+    ci        = res["ci_results"]
+    models_list = list(all_metrics.keys())
+
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
 
-        # ── CSVs ──────────────────────────────────────────────────────────────
-        # 1. Model metrics
+        # ══════════════════════════════════════════════════════════════════════
+        # TAB 1 — COMPARISON
+        # ══════════════════════════════════════════════════════════════════════
+
+        # model_metrics.csv
         rows = []
         for name, m in all_metrics.items():
             rows.append({
@@ -179,18 +194,19 @@ def build_results_zip(res, all_metrics, all_preds, y_test, feat_sel, importances
                 "test_aic": round(m["test_aic"], 2),
                 "test_bic": round(m["test_bic"], 2),
             })
-        zf.writestr("model_metrics.csv", pd.DataFrame(rows).to_csv(index=False))
+        zf.writestr("tab1_comparison/model_metrics.csv",
+                    pd.DataFrame(rows).to_csv(index=False))
 
-        # 2. Predictions + residuals
+        # predictions_and_residuals.csv
         pred_df = pd.DataFrame({"y_actual": y_test})
         for name, yp in all_preds.items():
-            col = name.lower().replace(" ", "_").replace("+", "_")
+            col = _safe(name).lower()
             pred_df[f"pred_{col}"] = yp
             pred_df[f"residual_{col}"] = y_test - yp
-        zf.writestr("predictions_and_residuals.csv", pred_df.to_csv(index=False))
+        zf.writestr("tab1_comparison/predictions_and_residuals.csv",
+                    pred_df.to_csv(index=False))
 
-        # 3. Bootstrap CIs
-        ci = res["ci_results"]
+        # bootstrap_confidence_intervals.csv
         ci_rows = [{
             "model": m,
             "r2_mean": round(ci[m]["r2_mean"], 4),
@@ -200,31 +216,136 @@ def build_results_zip(res, all_metrics, all_preds, y_test, feat_sel, importances
             "rmse_lo_95": round(ci[m]["rmse_lo"], 4),
             "rmse_hi_95": round(ci[m]["rmse_hi"], 4),
         } for m in ci]
-        zf.writestr("bootstrap_confidence_intervals.csv",
+        zf.writestr("tab1_comparison/bootstrap_confidence_intervals.csv",
                     pd.DataFrame(ci_rows).to_csv(index=False))
 
-        # 4. EBM feature importance
-        main_idxs = [i for i, tf in enumerate(res["ebm"].term_features_) if len(tf) == 1]
-        ebm_imp_df = pd.DataFrame([
-            {"feature": term_names[i], "ebm_importance": round(float(importances[i]), 6)}
-            for i in sorted(main_idxs, key=lambda i: importances[i], reverse=True)
-        ])
-        zf.writestr("ebm_feature_importance.csv", ebm_imp_df.to_csv(index=False))
+        # nam_convergence.csv (both variants)
+        tl, vl   = res["train_losses"],      res["val_losses"]
+        tl_b, vl_b = res["train_losses_base"], res["val_losses_base"]
+        conv_df = pd.DataFrame({
+            "cycle": range(len(tl)),
+            "nam_train_rmse": tl_b, "nam_val_rmse": vl_b,
+            "nam_inter_train_rmse": tl, "nam_inter_val_rmse": vl,
+        })
+        zf.writestr("tab1_comparison/nam_convergence.csv",
+                    conv_df.to_csv(index=False))
 
-        # 5. NAM feature importance (mean |contribution|)
-        contributions = res["contributions"]
-        mean_abs = [float(np.abs(c).mean()) for c in contributions]
-        nam_imp_df = pd.DataFrame([
-            {"feature": feat_sel[i], "mean_abs_contribution": round(mean_abs[i], 6)}
-            for i in np.argsort(mean_abs)[::-1]
-        ])
-        zf.writestr("nam_feature_importance.csv", nam_imp_df.to_csv(index=False))
+        # ══════════════════════════════════════════════════════════════════════
+        # TAB 2 — EBM MAIN EFFECTS
+        # ══════════════════════════════════════════════════════════════════════
 
-        # 6. Residual summary statistics per model
+        main_idxs = [i for i, tf in enumerate(ebm_obj.term_features_) if len(tf) == 1]
+        ebm_global_ = ebm_obj.explain_global()
+        ebm_imps    = ebm_obj.term_importances()
+
+        # ebm_feature_importance.csv
+        ebm_imp_rows = [
+            {"feature": term_names[i], "importance": round(float(ebm_imps[i]), 6)}
+            for i in sorted(main_idxs, key=lambda i: ebm_imps[i], reverse=True)
+        ]
+        zf.writestr("tab2_ebm_main_effects/ebm_feature_importance.csv",
+                    pd.DataFrame(ebm_imp_rows).to_csv(index=False))
+
+        # ebm_shape_data.csv — raw x/y for every main-effect term
+        shape_rows = []
+        for idx in main_idxs:
+            feat = term_names[idx]
+            data = ebm_global_.data(idx)
+            try:
+                x_raw = np.array(data["names"], dtype=float)
+                y_sc  = np.array(data["scores"])
+                n     = min(len(x_raw), len(y_sc))
+                x_orig = inv_1d(x_raw[:n], feat, scaler_, all_feat_)
+                for xi, yi in zip(x_orig, y_sc[:n]):
+                    shape_rows.append({"feature": feat, "x_original_units": round(float(xi), 6),
+                                       "shape_contribution": round(float(yi), 6)})
+            except Exception:
+                pass
+        zf.writestr("tab2_ebm_main_effects/ebm_shape_data.csv",
+                    pd.DataFrame(shape_rows).to_csv(index=False))
+
+        # ══════════════════════════════════════════════════════════════════════
+        # TAB 3 — EBM INTERACTIONS
+        # ══════════════════════════════════════════════════════════════════════
+
+        inter_idxs = [i for i, tf in enumerate(ebm_obj.term_features_) if len(tf) > 1]
+        inter_sort = sorted(inter_idxs, key=lambda i: ebm_imps[i], reverse=True)
+        feat_names_in_ = list(ebm_obj.feature_names_in_)
+
+        # ebm_interaction_importance.csv
+        inter_imp_rows = [{
+            "rank": rank + 1,
+            "pair": term_names[i],
+            "feature_a": feat_names_in_[ebm_obj.term_features_[i][0]],
+            "feature_b": feat_names_in_[ebm_obj.term_features_[i][1]],
+            "importance": round(float(ebm_imps[i]), 6),
+        } for rank, i in enumerate(inter_sort)]
+        zf.writestr("tab3_ebm_interactions/ebm_interaction_importance.csv",
+                    pd.DataFrame(inter_imp_rows).to_csv(index=False))
+
+        # ══════════════════════════════════════════════════════════════════════
+        # TAB 4 — NAM SHAPE FUNCTIONS
+        # ══════════════════════════════════════════════════════════════════════
+
+        for variant, contrib_key, label in [
+            ("nam", "contributions_base", "NAM"),
+            ("nam_interactions", "contributions", "NAM+Interactions"),
+        ]:
+            contribs_ = res[contrib_key]
+            mean_abs_ = [float(np.abs(c).mean()) for c in contribs_]
+            imp_rows  = [
+                {"feature": feat_sel[i], "mean_abs_contribution": round(mean_abs_[i], 6)}
+                for i in np.argsort(mean_abs_)[::-1]
+            ]
+            zf.writestr(f"tab4_nam_shapes/{variant}_feature_importance.csv",
+                        pd.DataFrame(imp_rows).to_csv(index=False))
+
+            shape_rows_ = []
+            for i, feat in enumerate(feat_sel):
+                try:
+                    x_sc   = X_test_[:, i]
+                    x_orig = inv_1d(x_sc, feat, scaler_, all_feat_)
+                    y_c    = contribs_[i].ravel()
+                    sidx   = np.argsort(x_orig)
+                    for xi, yi in zip(x_orig[sidx], y_c[sidx]):
+                        shape_rows_.append({"feature": feat,
+                                            "x_original_units": round(float(xi), 6),
+                                            "contribution": round(float(yi), 6)})
+                except Exception:
+                    pass
+            zf.writestr(f"tab4_nam_shapes/{variant}_shape_data.csv",
+                        pd.DataFrame(shape_rows_).to_csv(index=False))
+
+        # NAM interaction contributions per pair
+        inter_rows_ = []
+        for label_, contrib_ in zip(res["pair_labels"], res["inter_contribs"]):
+            ni, nj = label_.split(" x ")
+            if ni not in feat_sel or nj not in feat_sel:
+                continue
+            ci_ = list(feat_sel).index(ni)
+            cj_ = list(feat_sel).index(nj)
+            xi  = inv_1d(X_test_[:, ci_], ni, scaler_, all_feat_)
+            xj  = inv_1d(X_test_[:, cj_], nj, scaler_, all_feat_)
+            c_  = contrib_.ravel()
+            for a, b, cv in zip(xi, xj, c_):
+                inter_rows_.append({"pair": label_,
+                                    f"{ni}_original": round(float(a), 6),
+                                    f"{nj}_original": round(float(b), 6),
+                                    "contribution": round(float(cv), 6)})
+        if inter_rows_:
+            zf.writestr("tab4_nam_shapes/nam_interaction_contributions.csv",
+                        pd.DataFrame(inter_rows_).to_csv(index=False))
+
+        # ══════════════════════════════════════════════════════════════════════
+        # TAB 5 — DIAGNOSTICS
+        # ══════════════════════════════════════════════════════════════════════
+
         resid_rows = []
         for name, yp in all_preds.items():
             r = y_test - yp
             sw_stat, sw_p = stats.shapiro(r) if 3 <= len(r) <= 5000 else (np.nan, np.nan)
+            within_1sd = float(np.mean(np.abs((r - r.mean()) / (r.std(ddof=1) + 1e-12)) <= 1) * 100)
+            within_2sd = float(np.mean(np.abs((r - r.mean()) / (r.std(ddof=1) + 1e-12)) <= 2) * 100)
             resid_rows.append({
                 "model": name,
                 "mean_residual": round(float(r.mean()), 6),
@@ -233,15 +354,35 @@ def build_results_zip(res, all_metrics, all_preds, y_test, feat_sel, importances
                 "excess_kurtosis": round(float(stats.kurtosis(r)), 4),
                 "shapiro_wilk_stat": round(float(sw_stat), 4) if not np.isnan(sw_stat) else "",
                 "shapiro_wilk_p": round(float(sw_p), 4) if not np.isnan(sw_p) else "",
+                "within_1sd_pct": round(within_1sd, 1),
+                "within_2sd_pct": round(within_2sd, 1),
             })
-        zf.writestr("residual_diagnostics_summary.csv",
+        zf.writestr("tab5_diagnostics/residual_diagnostics_summary.csv",
                     pd.DataFrame(resid_rows).to_csv(index=False))
 
-        # ── PNGs ──────────────────────────────────────────────────────────────
+        # ══════════════════════════════════════════════════════════════════════
+        # TAB 6 — EBM INTERACTION SWEEP
+        # ══════════════════════════════════════════════════════════════════════
+
+        if sweep_df is not None:
+            zf.writestr("tab6_ebm_sweep/ebm_interaction_sweep.csv",
+                        sweep_df.to_csv(index=False))
+
+        # ══════════════════════════════════════════════════════════════════════
+        # TAB 7 — PIPELINE LOG
+        # ══════════════════════════════════════════════════════════════════════
+
+        if pipeline_log:
+            zf.writestr("tab7_log/pipeline_log.txt", pipeline_log)
+
+        # ══════════════════════════════════════════════════════════════════════
+        # PNGs (all tabs)
+        # ══════════════════════════════════════════════════════════════════════
         try:
             import plotly.io as pio
+            colors_ci = [MODEL_COLORS[m] for m in models_list]
 
-            # Predicted vs actual — one per model
+            # ── Tab 1: predicted vs actual ────────────────────────────────────
             for name, yp in all_preds.items():
                 color = MODEL_COLORS[name]
                 mn = float(min(y_test.min(), yp.min()))
@@ -249,144 +390,256 @@ def build_results_zip(res, all_metrics, all_preds, y_test, feat_sel, importances
                 r2 = r2_score(y_test, yp)
                 rmse = float(np.sqrt(mean_squared_error(y_test, yp)))
                 fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=y_test, y=yp, mode="markers",
+                fig.add_trace(go.Scatter(x=y_test, y=yp, mode="markers",
                     marker=dict(color=color, size=7, opacity=0.75,
-                                line=dict(color="white", width=0.5)),
-                ))
-                fig.add_trace(go.Scatter(
-                    x=[mn, mx], y=[mn, mx], mode="lines",
-                    line=dict(color="#0f172a", dash="dot", width=1),
-                ))
-                fig.update_layout(
-                    title=f"{name} · R² = {r2:.4f} · RMSE = {rmse:.4f}",
-                    xaxis_title="Actual (V/√fc)", yaxis_title="Predicted (V/√fc)",
-                )
+                                line=dict(color="white", width=0.5))))
+                fig.add_trace(go.Scatter(x=[mn, mx], y=[mn, mx], mode="lines",
+                    line=dict(color="#0f172a", dash="dot", width=1)))
+                fig.update_layout(title=f"{name} · R² = {r2:.4f} · RMSE = {rmse:.4f}",
+                    xaxis_title="Actual (V/√fc)", yaxis_title="Predicted (V/√fc)")
                 _style_fig(fig, height=500)
-                fname = "pred_vs_actual_" + name.lower().replace(" ", "_").replace("+", "_") + ".png"
-                zf.writestr(f"plots/{fname}", pio.to_image(fig, format="png", scale=2))
+                zf.writestr(f"tab1_comparison/pred_vs_actual_{_safe(name).lower()}.png",
+                            pio.to_image(fig, format="png", scale=2))
 
-            # Residuals vs predicted — one per model
-            for name, yp in all_preds.items():
-                color = MODEL_COLORS[name]
-                residuals = y_test - yp
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=yp, y=residuals, mode="markers",
-                    marker=dict(color=color, size=7, opacity=0.75,
-                                line=dict(color="white", width=0.5)),
+            # ── Tab 1: model comparison bars ──────────────────────────────────
+            for metric_key, metric_label in [
+                ("test_r2", "Test R²"), ("test_adj_r2", "Test Adj R²"),
+                ("test_rmse", "Test RMSE"), ("test_mae", "Test MAE"),
+            ]:
+                vals = [all_metrics[m][metric_key] for m in models_list]
+                fig = go.Figure(go.Bar(x=models_list, y=vals,
+                    marker_color=[MODEL_COLORS[m] for m in models_list],
+                    text=[f"{v:.4f}" for v in vals], textposition="outside"))
+                fig.update_layout(title=f"Model comparison — {metric_label}",
+                                  yaxis_title=metric_label)
+                _style_fig(fig, height=400)
+                zf.writestr(f"tab1_comparison/model_comparison_{_safe(metric_label).lower()}.png",
+                            pio.to_image(fig, format="png", scale=2))
+
+            # ── Tab 1: bootstrap CI — R² and RMSE ────────────────────────────
+            for ci_metric, ci_label in [("r2", "R²"), ("rmse", "RMSE")]:
+                fig = go.Figure(go.Bar(
+                    x=models_list,
+                    y=[ci[m][f"{ci_metric}_mean"] for m in models_list],
+                    error_y=dict(type="data", symmetric=False,
+                        array=[ci[m][f"{ci_metric}_hi"] - ci[m][f"{ci_metric}_mean"] for m in models_list],
+                        arrayminus=[ci[m][f"{ci_metric}_mean"] - ci[m][f"{ci_metric}_lo"] for m in models_list],
+                        color="#0f172a", thickness=1.2),
+                    marker_color=colors_ci,
+                    text=[f'{ci[m][f"{ci_metric}_mean"]:.4f}' for m in models_list],
+                    textposition="outside",
                 ))
-                fig.add_hline(y=0, line_dash="dot", line_color="#0f172a")
-                fig.update_layout(
-                    title=f"{name} · Residuals vs Predicted",
-                    xaxis_title="Predicted (V/√fc)", yaxis_title="Residual",
-                )
-                _style_fig(fig, height=450)
-                fname = "residuals_vs_predicted_" + name.lower().replace(" ", "_").replace("+", "_") + ".png"
-                zf.writestr(f"plots/{fname}", pio.to_image(fig, format="png", scale=2))
+                fig.update_layout(title=f"{ci_label} ± 95% Bootstrap CI", yaxis_title=ci_label)
+                _style_fig(fig, height=400)
+                zf.writestr(f"tab1_comparison/bootstrap_ci_{ci_metric}.png",
+                            pio.to_image(fig, format="png", scale=2))
 
-            # Model comparison bar — Test R²
-            models_list = list(all_metrics.keys())
-            r2_vals = [all_metrics[m]["test_r2"] for m in models_list]
-            fig = go.Figure(go.Bar(
-                x=models_list, y=r2_vals,
-                marker_color=list(MODEL_COLORS.values()),
-                text=[f"{v:.4f}" for v in r2_vals], textposition="outside",
-            ))
-            fig.update_layout(title="Model comparison — Test R²", yaxis_title="Test R²")
-            _style_fig(fig, height=400)
-            zf.writestr("plots/model_comparison_test_r2.png",
+            # ── Tab 1: NAM convergence ────────────────────────────────────────
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(y=tl_b, mode="lines+markers", name="NAM train",
+                line=dict(color=MODEL_COLORS["NAM"], width=1.8, dash="dash")))
+            fig.add_trace(go.Scatter(y=vl_b, mode="lines+markers", name="NAM val",
+                line=dict(color=MODEL_COLORS["NAM"], width=1.8, dash="dot")))
+            fig.add_trace(go.Scatter(y=tl, mode="lines+markers", name="NAM+Inter train",
+                line=dict(color=MODEL_COLORS["NAM+Interactions"], width=2)))
+            fig.add_trace(go.Scatter(y=vl, mode="lines+markers", name="NAM+Inter val",
+                line=dict(color=MODEL_COLORS["NAM+Interactions"], width=2, dash="dot")))
+            fig.update_layout(xaxis_title="Backfitting cycle", yaxis_title="RMSE (raw sum)")
+            _style_fig(fig, height=360, legend_y=0.97)
+            zf.writestr("tab1_comparison/nam_convergence.png",
                         pio.to_image(fig, format="png", scale=2))
 
-            # Bootstrap CI — R²
-            colors_ci = [MODEL_COLORS[m] for m in models_list]
-            ci = res["ci_results"]
-            fig = go.Figure(go.Bar(
-                x=models_list,
-                y=[ci[m]["r2_mean"] for m in models_list],
-                error_y=dict(
-                    type="data", symmetric=False,
-                    array=[ci[m]["r2_hi"] - ci[m]["r2_mean"] for m in models_list],
-                    arrayminus=[ci[m]["r2_mean"] - ci[m]["r2_lo"] for m in models_list],
-                ),
-                marker_color=colors_ci,
-                text=[f'{ci[m]["r2_mean"]:.4f}' for m in models_list],
-                textposition="outside",
-            ))
-            fig.update_layout(title="R² ± 95% Bootstrap CI", yaxis_title="R²")
-            _style_fig(fig, height=400)
-            zf.writestr("plots/bootstrap_ci_r2.png",
-                        pio.to_image(fig, format="png", scale=2))
-
-            # ── EBM main-effect shape functions ──────────────────────────────
-            ebm_obj     = res["ebm"]
-            ebm_global_ = ebm_obj.explain_global()
-            ebm_imps    = ebm_obj.term_importances()
-            main_idxs_  = [i for i, tf in enumerate(ebm_obj.term_features_) if len(tf) == 1]
-            main_sort_  = sorted(main_idxs_, key=lambda i: ebm_imps[i], reverse=True)
-            scaler_     = res["scaler"]
-            all_feat_   = res["all_feature_names"]
-
+            # ── Tab 2: EBM main-effect shapes ─────────────────────────────────
+            main_sort_ = sorted(main_idxs, key=lambda i: ebm_imps[i], reverse=True)
             for idx in main_sort_:
                 feat = term_names[idx]
                 data = ebm_global_.data(idx)
                 try:
-                    x_raw  = np.array(data["names"], dtype=float)
-                    y_vals = np.array(data["scores"])
-                    n      = min(len(x_raw), len(y_vals))
+                    x_raw = np.array(data["names"], dtype=float)
+                    y_sc  = np.array(data["scores"])
+                    n     = min(len(x_raw), len(y_sc))
                     x_orig = inv_1d(x_raw[:n], feat, scaler_, all_feat_)
-                    y_vals = y_vals[:n]
                     fig = go.Figure()
-                    fig.add_trace(go.Scatter(
-                        x=x_orig, y=y_vals, mode="lines",
+                    fig.add_trace(go.Scatter(x=x_orig, y=y_sc[:n], mode="lines",
                         line=dict(color=MODEL_COLORS["EBM"], width=2.2),
-                        fill="tozeroy", fillcolor="rgba(153,27,27,0.10)",
-                    ))
+                        fill="tozeroy", fillcolor="rgba(153,27,27,0.10)"))
                     fig.add_hline(y=0, line_dash="dot", line_color="#cbd5e1")
-                    fig.update_layout(
-                        title=f"EBM shape: {feat}  (importance={ebm_imps[idx]:.4f})",
-                        xaxis_title=feat, yaxis_title="Shape contribution",
-                    )
+                    fig.update_layout(title=f"EBM shape: {feat}  (importance={ebm_imps[idx]:.4f})",
+                        xaxis_title=feat, yaxis_title="Shape contribution")
                     _style_fig(fig, height=350)
-                    safe = feat.replace("/", "_").replace(" ", "_")
-                    zf.writestr(f"plots/ebm_shape_{safe}.png",
+                    zf.writestr(f"tab2_ebm_main_effects/ebm_shape_{_safe(feat)}.png",
                                 pio.to_image(fig, format="png", scale=2))
                 except Exception:
                     pass
 
-            # ── NAM single-feature shape functions ───────────────────────────
-            contributions_ = res["contributions"]
-            X_test_sel_    = res["X_test_sel"]
-            mean_abs_      = [float(np.abs(c).mean()) for c in contributions_]
-
-            for i, feat in enumerate(feat_sel):
+            # ── Tab 3: EBM interaction heatmaps ───────────────────────────────
+            for idx in inter_sort:
+                term   = term_names[idx]
+                fi     = ebm_obj.term_features_[idx]
+                ni, nj = feat_names_in_[fi[0]], feat_names_in_[fi[1]]
+                data   = ebm_global_.data(idx)
                 try:
-                    x_scaled  = X_test_sel_[:, i]
-                    x_orig    = inv_1d(x_scaled, feat, scaler_, all_feat_)
-                    y_contrib = contributions_[i].ravel()
-                    sort_idx  = np.argsort(x_orig)
+                    _raw = data.get("scores") or data.get("values") or []
+                    scores = np.array(_raw)
+                    if scores.ndim != 2:
+                        continue
+                    if "names" in data and len(data["names"]) == 2:
+                        bins_i = np.array(data["names"][0], dtype=float)
+                        bins_j = np.array(data["names"][1], dtype=float)
+                    elif "left_names" in data:
+                        bins_i = np.array(data["left_names"], dtype=float)
+                        bins_j = np.array(data["right_names"], dtype=float)
+                    else:
+                        bins_i = np.arange(scores.shape[0], dtype=float)
+                        bins_j = np.arange(scores.shape[1], dtype=float)
+                    xi_o = inv_1d(bins_i, ni, scaler_, all_feat_)
+                    xj_o = inv_1d(bins_j, nj, scaler_, all_feat_)
+                    vmax = float(np.abs(scores).max()) or 1.0
                     fig = go.Figure()
-                    fig.add_trace(go.Scatter(
-                        x=x_orig[sort_idx], y=y_contrib[sort_idx], mode="lines",
-                        line=dict(color=MODEL_COLORS["NAM+Interactions"], width=2.2),
-                        fill="tozeroy", fillcolor="rgba(54,83,20,0.10)",
-                    ))
-                    fig.add_hline(y=0, line_dash="dot", line_color="#cbd5e1")
-                    fig.update_layout(
-                        title=f"NAM shape: {feat}  (mean|contrib|={mean_abs_[i]:.4f})",
-                        xaxis_title=feat, yaxis_title="Contribution",
-                    )
-                    _style_fig(fig, height=350)
-                    safe = feat.replace("/", "_").replace(" ", "_")
-                    zf.writestr(f"plots/nam_shape_{safe}.png",
+                    fig.add_trace(go.Heatmap(x=xi_o, y=xj_o, z=scores.T,
+                        colorscale="RdBu_r", zmid=0, zmin=-vmax, zmax=vmax,
+                        colorbar=dict(title="Contribution", len=0.85, thickness=14)))
+                    fig.update_layout(xaxis_title=f"{ni} (original units)",
+                                      yaxis_title=f"{nj} (original units)")
+                    _style_fig(fig, height=460)
+                    zf.writestr(f"tab3_ebm_interactions/ebm_interaction_{_safe(term)}.png",
                                 pio.to_image(fig, format="png", scale=2))
                 except Exception:
                     pass
 
-        except Exception:
-            # kaleido not installed or export failed — PNGs omitted gracefully
-            zf.writestr("plots/README.txt",
-                        "PNG export requires kaleido. Install with: pip install kaleido")
+            # ── Tab 4: NAM shape plots (both variants) ────────────────────────
+            for variant, contrib_key, color_, fill_ in [
+                ("nam",          "contributions_base", MODEL_COLORS["NAM"],              "rgba(29,78,216,0.10)"),
+                ("nam_inter",    "contributions",      MODEL_COLORS["NAM+Interactions"], "rgba(54,83,20,0.10)"),
+            ]:
+                contribs_ = res[contrib_key]
+                mean_abs_ = [float(np.abs(c).mean()) for c in contribs_]
+                for i, feat in enumerate(feat_sel):
+                    try:
+                        x_sc   = X_test_[:, i]
+                        x_orig = inv_1d(x_sc, feat, scaler_, all_feat_)
+                        y_c    = contribs_[i].ravel()
+                        sidx   = np.argsort(x_orig)
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(x=x_orig[sidx], y=y_c[sidx], mode="lines",
+                            line=dict(color=color_, width=2.2),
+                            fill="tozeroy", fillcolor=fill_))
+                        fig.add_hline(y=0, line_dash="dot", line_color="#cbd5e1")
+                        fig.update_layout(
+                            title=f"{variant} shape: {feat}  (mean|contrib|={mean_abs_[i]:.4f})",
+                            xaxis_title=feat, yaxis_title="Contribution")
+                        _style_fig(fig, height=350)
+                        zf.writestr(f"tab4_nam_shapes/{variant}_shape_{_safe(feat)}.png",
+                                    pio.to_image(fig, format="png", scale=2))
+                    except Exception:
+                        pass
+
+            # ── Tab 4: NAM interaction scatter plots ──────────────────────────
+            for label_, contrib_ in zip(res["pair_labels"], res["inter_contribs"]):
+                ni, nj = label_.split(" x ")
+                if ni not in feat_sel or nj not in feat_sel:
+                    continue
+                ci__ = list(feat_sel).index(ni)
+                cj__ = list(feat_sel).index(nj)
+                xi   = inv_1d(X_test_[:, ci__], ni, scaler_, all_feat_)
+                xj   = inv_1d(X_test_[:, cj__], nj, scaler_, all_feat_)
+                c_   = contrib_.ravel()
+                vmax = float(np.abs(c_).max()) or 1.0
+                fig  = go.Figure(go.Scatter(x=xi, y=xj, mode="markers",
+                    marker=dict(color=c_, colorscale="RdBu_r", cmin=-vmax, cmax=vmax,
+                                colorbar=dict(title="Contribution", thickness=14),
+                                size=8, opacity=0.85, line=dict(color="white", width=0.4)),
+                    hovertemplate=f"{ni}=%{{x:.3f}}<br>{nj}=%{{y:.3f}}<br>contrib=%{{marker.color:.4f}}<extra></extra>"))
+                fig.update_layout(xaxis_title=f"{ni} (original units)",
+                                  yaxis_title=f"{nj} (original units)")
+                _style_fig(fig, height=440)
+                zf.writestr(f"tab4_nam_shapes/nam_interaction_{_safe(label_)}.png",
+                            pio.to_image(fig, format="png", scale=2))
+
+            # ── Tab 5: residual diagnostics — one set per model ───────────────
+            for name, yp in all_preds.items():
+                color = MODEL_COLORS[name]
+                r     = y_test - yp
+                mean_r, std_r = float(r.mean()), float(r.std(ddof=1))
+
+                # residuals vs predicted
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=yp, y=r, mode="markers",
+                    marker=dict(color=color, size=7, opacity=0.75,
+                                line=dict(color="white", width=0.5))))
+                fig.add_hline(y=0, line_dash="dot", line_color="#0f172a")
+                fig.update_layout(title=f"{name} · Residuals vs Predicted",
+                    xaxis_title="Predicted (V/√fc)", yaxis_title="Residual")
+                _style_fig(fig, height=420)
+                zf.writestr(f"tab5_diagnostics/residuals_vs_predicted_{_safe(name).lower()}.png",
+                            pio.to_image(fig, format="png", scale=2))
+
+                # residual histogram + normal fit
+                xs  = np.linspace(r.min(), r.max(), 200)
+                pdf = stats.norm.pdf(xs, loc=mean_r, scale=std_r)
+                fig = go.Figure()
+                fig.add_trace(go.Histogram(x=r, nbinsx=25, histnorm="probability density",
+                    marker=dict(color=color, line=dict(color="white", width=0.8)), opacity=0.8))
+                fig.add_trace(go.Scatter(x=xs, y=pdf, mode="lines",
+                    line=dict(color="#0f172a", width=1.8, dash="dot")))
+                fig.update_layout(title=f"{name} · Residual distribution",
+                    xaxis_title="Residual", yaxis_title="Density")
+                _style_fig(fig, height=400)
+                zf.writestr(f"tab5_diagnostics/residual_histogram_{_safe(name).lower()}.png",
+                            pio.to_image(fig, format="png", scale=2))
+
+                # Q-Q plot
+                qq_x, qq_y = stats.probplot(r, dist="norm", fit=False)
+                slope_, intercept_, *_ = stats.linregress(qq_x, qq_y)
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=qq_x, y=qq_y, mode="markers",
+                    marker=dict(color=color, size=7, opacity=0.8,
+                                line=dict(color="white", width=0.5))))
+                lx = np.array([qq_x.min(), qq_x.max()])
+                fig.add_trace(go.Scatter(x=lx, y=intercept_ + slope_ * lx, mode="lines",
+                    line=dict(color="#0f172a", width=1.4, dash="dot")))
+                fig.update_layout(title=f"{name} · Q–Q plot",
+                    xaxis_title="Theoretical quantiles", yaxis_title="Sample quantiles")
+                _style_fig(fig, height=380)
+                zf.writestr(f"tab5_diagnostics/residual_qq_{_safe(name).lower()}.png",
+                            pio.to_image(fig, format="png", scale=2))
+
+            # ── Tab 6: EBM sweep plots ────────────────────────────────────────
+            if sweep_df is not None:
+                xs_ = sweep_df["n_interactions"].tolist()
+                for col, label, higher in [
+                    ("test_r2",     "Test R²",      True),
+                    ("test_adj_r2", "Test Adj R²",  True),
+                    ("test_rmse",   "Test RMSE",    False),
+                    ("test_mae",    "Test MAE",     False),
+                    ("r2_gap",      "R² gap",       False),
+                    ("rmse_gap",    "RMSE gap",     False),
+                    ("ci_width_r2", "CI width R²",  False),
+                    ("bias",        "|Mean residual|", False),
+                    ("test_aic",    "AIC",          False),
+                    ("test_bic",    "BIC",          False),
+                ]:
+                    best_i = sweep_df[col].idxmax() if higher else sweep_df[col].idxmin()
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=xs_, y=sweep_df[col].tolist(),
+                        mode="lines+markers",
+                        line=dict(color=MODEL_COLORS["EBM"], width=2.2),
+                        marker=dict(size=8)))
+                    fig.add_trace(go.Scatter(
+                        x=[sweep_df.loc[best_i, "n_interactions"]],
+                        y=[sweep_df.loc[best_i, col]], mode="markers",
+                        marker=dict(color="#0f172a", size=12, symbol="star"),
+                        name=f"Best (n={sweep_df.loc[best_i,'n_interactions']})"))
+                    fig.update_layout(title=f"EBM sweep — {label}",
+                        xaxis_title="n_interactions", yaxis_title=label,
+                        xaxis=dict(tickmode="linear", tick0=0, dtick=1))
+                    _style_fig(fig, height=320)
+                    zf.writestr(f"tab6_ebm_sweep/sweep_{_safe(label).lower()}.png",
+                                pio.to_image(fig, format="png", scale=2))
+
+        except Exception as e:
+            zf.writestr("plots_error.txt",
+                        f"PNG export failed: {e}\nInstall kaleido: pip install kaleido")
 
     buf.seek(0)
     return buf.read()
@@ -438,12 +691,14 @@ with st.sidebar:
                             "Random Forest":    _res["rf_metrics"],
                             "XGBoost":          _res["xgb_metrics"],
                             "EBM":              _res["ebm_metrics"],
+                            "NAM":              _res["nam_base_metrics"],
                             "NAM+Interactions": _res["nam_metrics"],
                         },
                         {
                             "Random Forest":    _res["rf_pred"],
                             "XGBoost":          _res["xgb_pred"],
                             "EBM":              _res["ebm_pred"],
+                            "NAM":              _res["nam_base_pred"],
                             "NAM+Interactions": _res["nam_pred"],
                         },
                         _res["y_test"],
@@ -453,6 +708,8 @@ with st.sidebar:
                             " × ".join(str(n) for n in tn) if isinstance(tn, (list, tuple)) else str(tn)
                             for tn in _res["ebm"].term_names_
                         ],
+                        sweep_df=st.session_state.get("sweep_df"),
+                        pipeline_log=st.session_state.get("pipeline_log", ""),
                     )
                     st.session_state["zip_bytes"] = zip_bytes
                 except Exception as e:
